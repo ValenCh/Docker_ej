@@ -1,0 +1,172 @@
+name: adr-docker-tp
+
+# -----------------------------------------------------------------------
+# Arquitectura:
+#
+#   host:8080 -> [proxy] --/-------> [frontend] (estatico, Nginx)
+#                       \--/api/---> [backend]  (Node/Express) --> [db] (Postgres)
+#
+# Solo "proxy" publica un puerto al host. "db" y "backend" viven en una red
+# interna ("backend_net", internal: true) sin salida a internet ni acceso
+# directo desde el host: la unica puerta de entrada al sistema es el
+# reverse proxy.
+# -----------------------------------------------------------------------
+
+services:
+  db:
+    # A diferencia de node y nginx, la imagen de Postgres NO esta en el
+    # mirror de Microsoft (ni con el patch pinneado ni con el tag rolling
+    # "16-alpine" devuelve "manifest unknown": el mirror simplemente no
+    # incluye esta imagen en su catalogo). Por eso esta va directo a
+    # Docker Hub. Si el pull falla con un error de autenticacion, hay que
+    # loguearse con una cuenta real (ver seccion "Notas / troubleshooting"
+    # del README: "docker login" / "podman login" con un Access Token de
+    # Docker Hub, no con la contraseña de la cuenta).
+    image: postgres:16-alpine
+    container_name: adr_db
+    env_file:
+      - .env
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - backend_net
+    restart: unless-stopped
+    # --- Hardening ---
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Postgres necesita estos capabilities minimos para fijar permisos del
+    # directorio de datos y bajar privilegios de root a "postgres" al
+    # arrancar por primera vez.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+    mem_limit: 256m
+    pids_limit: 100
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: adr_backend
+    env_file:
+      - .env
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - backend_net
+    restart: unless-stopped
+    init: true # PID 1 = tini: garantiza manejo correcto de señales (SIGTERM/SIGKILL)
+    # --- Hardening ---
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 256m
+    pids_limit: 100
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:4000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: adr_frontend
+    networks:
+      - edge_net
+    restart: unless-stopped
+    # --- Hardening ---
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    mem_limit: 128m
+    pids_limit: 50
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  proxy:
+    build:
+      context: ./proxy
+      dockerfile: Dockerfile
+    container_name: adr_proxy
+    ports:
+      - "${PROXY_PORT:-8080}:8080"
+    networks:
+      - edge_net
+      - backend_net
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    restart: unless-stopped
+    # --- Hardening ---
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    mem_limit: 128m
+    pids_limit: 50
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/proxy-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+networks:
+  # Red "publica": solo el proxy y el frontend viven aca. El proxy es el
+  # unico servicio con puerto publicado hacia el host.
+  edge_net:
+    driver: bridge
+  # Red interna sin salida a internet: aisla la base de datos y el
+  # backend. El proxy tambien se conecta aca (unicamente) para poder
+  # reenviar /api/* al backend, pero no puede llegar a la DB directamente
+  # (solo el backend tiene esa ruta de acceso).
+  backend_net:
+    driver: bridge
+    internal: true
+
+volumes:
+  db_data:
